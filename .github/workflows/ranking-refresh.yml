@@ -1,0 +1,47 @@
+name: Global Volume Ranking Refresh
+
+# Rebuilds the cached global futures/perpetual volume ranking (CoinMarketCap) once a day and stores it on the
+# 'scanner-state' branch. The hourly scanner only READS the cache (it refreshes itself only if this job failed
+# and the cache is older than GLOBAL_RANKING_REFRESH_HOURS), so the CoinMarketCap API is not called per scan.
+on:
+  schedule:
+    - cron: "40 23 * * *"   # 23:40 UTC daily (clear of the :05 hourly scan windows around 00:00 UTC)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Refresh even if the cached ranking is recent"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# Same group as the scanner: never runs concurrently with a scan (both write the state branch).
+concurrency:
+  group: po3-scanner
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Load state
+        run: bash scripts/state_branch.sh load
+      - name: Refresh global ranking
+        env:
+          COINMARKETCAP_API_KEY: ${{ secrets.COINMARKETCAP_API_KEY }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          ARGS="--refresh-ranking"
+          if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
+          python scanner.py $ARGS
+      - name: Save state
+        if: always()
+        run: bash scripts/state_branch.sh save

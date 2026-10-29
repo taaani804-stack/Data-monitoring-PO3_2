@@ -1,0 +1,78 @@
+name: PO3 SHORT Scanner
+
+on:
+  schedule:
+    # Hourly, 5 minutes past the UTC hour so the just-closed candle is final.
+    # ONE entry is enough: the scanner itself decides which of 1H / 4H / 1D are due (from the exchange's
+    # candle timestamps + persisted progress) and runs them sequentially: 1D -> 4H -> 1H, ~10 min apart.
+    - cron: "5 * * * *"
+  workflow_dispatch:
+    inputs:
+      timeframes:
+        description: "auto = run whatever is due; or force: all / 1d / 4h / 1h (comma list allowed, e.g. 4h,1h)"
+        type: string
+        default: "auto"
+      dry_run:
+        description: "Dry run: print signals in the log, send nothing, don't touch state"
+        type: boolean
+        default: false
+      telegram_test:
+        description: "Only send a Telegram test message to verify the secrets"
+        type: boolean
+        default: false
+
+# contents: write is needed only to push the 'scanner-state' branch.
+permissions:
+  contents: write
+
+# One run at a time: overlapping runs would race on the state branch and could double-send.
+# A queued run waits (never cancels a running scan); because "due" is derived from persisted progress,
+# a skipped/merged schedule tick loses nothing.
+concurrency:
+  group: po3-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # Worst case: 2 x 10 min gaps + 3 scans (~3-5 min each) + start-up.
+    timeout-minutes: 50
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Load state
+        run: bash scripts/state_branch.sh load
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Global futures-volume ranking (CoinMarketCap). Used only when the cached ranking is older than
+          # GLOBAL_RANKING_REFRESH_HOURS (the daily ranking-refresh workflow normally keeps it fresh).
+          COINMARKETCAP_API_KEY: ${{ secrets.COINMARKETCAP_API_KEY }}
+          # State is pushed after every timeframe scan, so a cancel/timeout cannot lose delivered-signal records.
+          STATE_SYNC_COMMAND: "bash scripts/state_branch.sh save"
+          TIMEFRAMES: ${{ inputs.timeframes }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          TELEGRAM_TEST: ${{ inputs.telegram_test }}
+        run: |
+          ARGS=""
+          if [ -n "$TIMEFRAMES" ] && [ "$TIMEFRAMES" != "auto" ]; then ARGS="$ARGS --timeframes $TIMEFRAMES"; fi
+          if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "$TELEGRAM_TEST" = "true" ]; then ARGS="$ARGS --telegram-test"; fi
+          python scanner.py $ARGS
+
+      # Final safety net (also runs after a failed scan step, or a cancellation).
+      - name: Save state
+        if: always()
+        run: bash scripts/state_branch.sh save
